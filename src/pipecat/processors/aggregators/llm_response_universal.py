@@ -799,6 +799,11 @@ class LLMUserAggregator(LLMContextAggregator):
         # pass), falling back to ``DEFAULT_TTFS_P99``.
         self._ttfs_p99_latency: float | None = None
         self._realtime_handoff_flush_task: asyncio.Task | None = None
+        # Realtime mode: ids of the LLMMessagesAppendFrames whose messages this
+        # aggregator added to the context before passing them on, so the paired
+        # assistant aggregator doesn't add them again (see
+        # _realtime_handle_messages_append).
+        self._realtime_appends_added_to_context: set[int] = set()
         # Full transcript across the user turn. Each
         # `_on_user_turn_inference_triggered` push captures only the
         # new segment since the previous push (push_aggregation resets
@@ -1323,6 +1328,46 @@ class LLMUserAggregator(LLMContextAggregator):
             await self.cancel_task(self._realtime_handoff_flush_task)
         self._realtime_handoff_flush_task = None
 
+    async def _realtime_handle_messages_append(self, frame: LLMMessagesAppendFrame):
+        """Add appended messages to the context and pass them on to the realtime service.
+
+        The messages are added to the context, as in a cascade pipeline. The
+        frame then goes on to the realtime service, which takes the messages
+        into its session as the frame passes through it, and to the assistant
+        aggregator, which decides when the model should answer them. The
+        assistant aggregator checks :meth:`_realtime_append_added_to_context` so it
+        doesn't add them again.
+
+        Why the service takes the messages from the frame, not from the
+        context:
+
+        - Timing. A realtime service doesn't wait for a context frame before it
+          answers the user. It answers as soon as the user stops talking, using
+          only what's already in its session. The assistant aggregator may send
+          the context much later (after the bot finishes speaking, for
+          example), or not at all (when the append doesn't ask the model to
+          answer). Messages that only arrived with the context could miss the
+          model's next answer.
+        - Telling messages apart. The user's own speech also ends up in the
+          context, sometimes late. The service has already heard that speech,
+          so it mustn't send it again, but in the context it looks just like a
+          typed message.
+        """
+        self.add_messages(frame.messages)
+        self._realtime_appends_added_to_context.add(frame.id)
+        await self.push_frame(frame)
+
+    def _realtime_append_added_to_context(self, frame: LLMMessagesAppendFrame) -> bool:
+        """Whether this aggregator already added the frame's messages to the context.
+
+        Called by the paired assistant aggregator when the frame reaches it, so
+        the messages aren't added twice. Answers True only once per frame.
+        """
+        if frame.id not in self._realtime_appends_added_to_context:
+            return False
+        self._realtime_appends_added_to_context.discard(frame.id)
+        return True
+
     async def _start_controllers(self):
         if self._vad_controller:
             await self._vad_controller.start()
@@ -1390,6 +1435,9 @@ class LLMUserAggregator(LLMContextAggregator):
         await self.push_context_frame()
 
     async def _handle_llm_messages_append(self, frame: LLMMessagesAppendFrame):
+        if self._realtime_service_mode:
+            await self._realtime_handle_messages_append(frame)
+            return
         self.add_messages(frame.messages)
         if frame.run_llm:
             await self.push_context_frame()
@@ -2169,7 +2217,17 @@ class LLMAssistantAggregator(LLMContextAggregator):
         # results queued behind it. Run at once, a message appended
         # mid-sentence runs the model on a context that lacks the answer in
         # progress, and the model answers it again.
-        self.add_messages(frame.messages)
+        #
+        # In realtime mode, the paired user aggregator adds an append's messages
+        # to the context before passing it on to the realtime service, so they
+        # aren't added again here.
+        already_added = (
+            self._realtime_service_mode
+            and self._paired_user_aggregator is not None
+            and self._paired_user_aggregator._realtime_append_added_to_context(frame)
+        )
+        if not already_added:
+            self.add_messages(frame.messages)
         if frame.run_llm:
             self._context_push_owed = True
         if self._context_push_owed and not self._user_speaking:
@@ -2858,7 +2916,10 @@ class LLMContextAggregatorPair:
                 (speech-to-speech) LLM service. When enabled, context writes
                 become trailing — driven by the content stream itself
                 (transcripts, ``LLMFullResponseStartFrame``) rather than turn
-                frames — and turn-end strategies stop waiting for transcripts.
+                frames — turn-end strategies stop waiting for transcripts, and
+                an ``LLMMessagesAppendFrame`` goes on to the service, which
+                takes its messages into its session, with the assistant
+                aggregator deciding when the model answers them.
                 ``None`` (the default) auto-configures: the mode turns on when a
                 realtime service announces itself via service metadata, and
                 stays off otherwise. ``True`` / ``False`` force it on or off
