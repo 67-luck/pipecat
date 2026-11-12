@@ -947,10 +947,14 @@ class LLMMessagesAppendFrame(DataFrame):
     Parameters:
         messages: List of context messages to append.
         run_llm: Whether the context update should be sent to the LLM.
+        added_to_context: Whether the messages are already in the context.
+            Set to ``True`` by the user aggregator when it adds them and passes
+            the frame on to a realtime LLM service. Defaults to ``False``.
     """
 
     messages: list[LLMContextMessage]
     run_llm: bool | None = None
+    added_to_context: bool = field(default=False, init=False)
 
 
 @dataclass

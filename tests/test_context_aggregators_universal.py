@@ -3397,6 +3397,7 @@ class TestRealtimeServiceModeAggregator(unittest.IsolatedAsyncioTestCase):
 
         appends = [f for f in down_frames if isinstance(f, LLMMessagesAppendFrame)]
         self.assertEqual([f.messages for f in appends], [[message]])
+        self.assertTrue(appends[0].added_to_context)
         self.assertFalse(any(isinstance(f, LLMContextFrame) for f in down_frames))
         self.assertEqual(context.get_messages(), [message])
 

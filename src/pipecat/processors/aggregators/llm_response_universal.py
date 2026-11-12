@@ -799,11 +799,6 @@ class LLMUserAggregator(LLMContextAggregator):
         # pass), falling back to ``DEFAULT_TTFS_P99``.
         self._ttfs_p99_latency: float | None = None
         self._realtime_handoff_flush_task: asyncio.Task | None = None
-        # Realtime mode: ids of the LLMMessagesAppendFrames whose messages this
-        # aggregator added to the context before passing them on, so the paired
-        # assistant aggregator doesn't add them again (see
-        # _realtime_handle_messages_append).
-        self._realtime_appends_added_to_context: set[int] = set()
         # Full transcript across the user turn. Each
         # `_on_user_turn_inference_triggered` push captures only the
         # new segment since the previous push (push_aggregation resets
@@ -1334,9 +1329,9 @@ class LLMUserAggregator(LLMContextAggregator):
         The messages are added to the context, as in a cascade pipeline. The
         frame then goes on to the realtime service, which takes the messages
         into its session as the frame passes through it, and to the assistant
-        aggregator, which decides when the model should answer them. The
-        assistant aggregator checks :meth:`_realtime_append_added_to_context` so it
-        doesn't add them again.
+        aggregator, which decides when the model should answer them. The frame
+        is marked ``added_to_context``, so the assistant aggregator doesn't add
+        the messages again.
 
         Why the service takes the messages from the frame, not from the
         context:
@@ -1354,19 +1349,8 @@ class LLMUserAggregator(LLMContextAggregator):
           typed message.
         """
         self.add_messages(frame.messages)
-        self._realtime_appends_added_to_context.add(frame.id)
+        frame.added_to_context = True
         await self.push_frame(frame)
-
-    def _realtime_append_added_to_context(self, frame: LLMMessagesAppendFrame) -> bool:
-        """Whether this aggregator already added the frame's messages to the context.
-
-        Called by the paired assistant aggregator when the frame reaches it, so
-        the messages aren't added twice. Answers True only once per frame.
-        """
-        if frame.id not in self._realtime_appends_added_to_context:
-            return False
-        self._realtime_appends_added_to_context.discard(frame.id)
-        return True
 
     async def _start_controllers(self):
         if self._vad_controller:
@@ -2218,15 +2202,7 @@ class LLMAssistantAggregator(LLMContextAggregator):
         # mid-sentence runs the model on a context that lacks the answer in
         # progress, and the model answers it again.
         #
-        # In realtime mode, the paired user aggregator adds an append's messages
-        # to the context before passing it on to the realtime service, so they
-        # aren't added again here.
-        already_added = (
-            self._realtime_service_mode
-            and self._paired_user_aggregator is not None
-            and self._paired_user_aggregator._realtime_append_added_to_context(frame)
-        )
-        if not already_added:
+        if not frame.added_to_context:
             self.add_messages(frame.messages)
         if frame.run_llm:
             self._context_push_owed = True
